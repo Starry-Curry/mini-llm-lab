@@ -1,0 +1,17 @@
+[project]
+name = "mini-llm-lab"
+version = "0.1.0"
+description = "从零手搓 Mini-LLM 到 Agent Harness 的全链路学习项目"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
