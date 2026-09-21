@@ -9,6 +9,7 @@ venv/
 # 数据 / 模型权重 / 缓存（保留在本机 D 盘，不上传）
 data/*
 !data/.gitkeep
+!data/*.py
 checkpoints/
 .cache/
 runs/
