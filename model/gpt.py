@@ -48,7 +48,14 @@ class CausalSelfAttention(nn.Module):
         mask = torch.tril(torch.ones(config.block_size, config.block_size))
         self.register_buffer("bias", mask.view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv_cache: tuple | None = None):
+        """返回 (输出, 新的kv_cache)。
+
+        kv_cache=None 时是训练路径，和以前完全一样。
+        传入 kv_cache=(k_old, v_old) 时是"增量解码"路径：把新 token 的 K/V
+        拼到缓存后面，Q 只和新 token 有关。此时 x 一般只有 1 个 token，
+        所有缓存都是"过去"，因此不需要因果掩码。
+        """
         B, T, C = x.shape  # [B, T, C]
 
         # 1) 一次算出 QKV，再沿最后一维切成三段，各 [B, T, C]
@@ -61,6 +68,19 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.head_size).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)
 
+        # KV cache：把历史 K/V 拼到当前 K/V 前面（沿"时间"维，即第 2 维）
+        past = 0
+        if kv_cache is not None:
+            if len(kv_cache) == 2:  # 非空缓存：拼到前面
+                k_old, v_old = kv_cache  # 各 [B, nh, T_past, hs]
+                past = k_old.size(2)
+                k = torch.cat([k_old, k], dim=2)
+                v = torch.cat([v_old, v], dim=2)
+            # 空元组 () 表示"第一次增量解码，没有历史，但要走缓存返回路径"
+            new_cache = (k, v)
+        else:
+            new_cache = None
+
         # 3) 注意力分数：Q 和 K 做内积，除以 sqrt(head_size) 防数值过大。
         #    k.transpose(-2,-1)：[B,nh,hs,T]；结果 att：[B,nh,T,T]，
         #    att[b,h,i,j] = "位置 i 对位置 j 的关注程度"。
@@ -68,7 +88,13 @@ class CausalSelfAttention(nn.Module):
 
         # 4) 因果掩码：把"未来位置"的分数设成 -inf，softmax 后它们变成 0。
         #    self.bias 的下三角是 1、上三角是 0；==0 的位置就是要屏蔽的未来。
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        #    规则：只要当前喂入的 token 数 >1，就要对"当前这批"内部做掩码
+        #    （缓存里的历史都已经是过去，天然无需掩）。单 token 增量时 T=1，
+        #    批内没有未来，跳过掩码。
+        if T > 1:
+            att = att.masked_fill(
+                self.bias[:, :, past : past + T, : past + T] == 0, float("-inf")
+            )
 
         # 5) 归一化成概率权重（每行和为 1），再对 V 加权求和：
         #    y[b,h,i,:] = sum_j softmax(att)[i,j] * v[b,h,j,:]
@@ -80,7 +106,7 @@ class CausalSelfAttention(nn.Module):
         #    transpose 之后内存不连续，view 前先 .contiguous()。
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
-        return self.resid_dropout(y)
+        return self.resid_dropout(y), new_cache
 
 
 class MLP(nn.Module):
@@ -108,12 +134,14 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv_cache: tuple | None = None):
+        """返回 (输出, 注意力层的新 cache)。"""
         # "x + f(ln(x))" 是残差连接：f 只学"需要修正的增量"，
         # 梯度能沿 x 这条短路直通回前面，深层网络才好训练。
-        x = x + self.attn(self.ln_1(x))
+        attn_out, new_cache = self.attn(self.ln_1(x), kv_cache)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, new_cache
 
 
 class GPT(nn.Module):
@@ -153,20 +181,29 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, kv_caches: list | None = None):
         """输入 token ids [B,T]；输出 (logits [B,T,V], loss 或 None)。"""
         B, T = idx.shape
         assert T <= self.config.block_size, "序列长度超过 block_size"
 
-        # 位置编号 0..T-1，两个嵌入相加
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        # 训练时位置从 0 开始；增量解码时从"已有缓存长度"继续编号。
+        # 缓存可能是空元组 ()（第一次），也可能是 (k, v)（后续），都要兼容。
+        past_len = 0
+        if kv_caches:
+            first = kv_caches[0]
+            if len(first) == 2:
+                past_len = first[0].size(2)
+        pos = torch.arange(past_len, past_len + T, dtype=torch.long, device=idx.device)
         tok_emb = self.transformer.wte(idx)        # [B,T,C]
         pos_emb = self.transformer.wpe(pos)        # [T,C]，广播到 [B,T,C]
         x = self.transformer.drop(tok_emb + pos_emb)
 
         # 依次过 N 个 Block
-        for block in self.transformer.h:
-            x = block(x)
+        new_caches = []
+        for i, block in enumerate(self.transformer.h):
+            cache_i = kv_caches[i] if kv_caches else None
+            x, new_cache = block(x, cache_i)
+            new_caches.append(new_cache)
 
         # 最后的归一化和"翻译层"：把 C 维映射成词表分数
         x = self.transformer.ln_f(x)
@@ -179,7 +216,10 @@ class GPT(nn.Module):
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1
             )
-        return logits, loss
+        # 训练路径维持原来的 2 元组返回；增量解码额外带上每层新 cache
+        if kv_caches is None:
+            return logits, loss
+        return logits, loss, new_caches
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int | None = None):
